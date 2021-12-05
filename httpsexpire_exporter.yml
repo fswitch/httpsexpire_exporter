@@ -1,0 +1,11 @@
+source_ip_address: 127.0.0.1
+source_ip_port: 9959
+query_time: 7200
+http_log_show: 0
+hosts:
+  google.com:
+    domain: google.com
+    ip: 142.250.180.206
+    port: 443
+  gmail.com:
+    domain: gmail.com

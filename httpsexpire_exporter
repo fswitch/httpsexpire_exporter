@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+
+# certifi
+# prettyprinter
+# pycurl (libcurl-devel, python3-devel, openssl-devel, gcc)
+# PyYAML
+
+# manual start:
+# python3 -m virt
+# source virt/bin/activate
+# python3 httpsexpire_exporter -- config=./httpsexpire_exporter.yml
+
+import multiprocessing
+import certifi
+import codecs
+import datetime
+from http.server import BaseHTTPRequestHandler
+from http.server import HTTPServer
+import math
+from multiprocessing import Process, Manager
+from io import BytesIO
+import pathlib
+from prettyprinter import pprint
+import pycurl
+import re
+import sys
+import time
+import yaml
+
+dirpath = str(pathlib.Path(__file__).parent.absolute())
+
+config_import = ''
+if len(sys.argv) > 1:
+    for arg in sys.argv:
+        row = arg.split('=')
+        if row[0] == '--config':
+            config_import = row[1].strip()
+
+if len(config_import) < 1:
+    config_import = dirpath+'/httpsexpire_exporter.yml'
+
+if len(config_import) < 1 or not pathlib.Path(config_import).exists():
+    print('No config file')
+    exit()
+
+with open(config_import, "r") as stream:
+    try:
+        confs = yaml.safe_load(stream)
+    except yaml.YAMLError as exc:
+        print(exc)
+        exit()
+
+# Get host certificate every HOST_GET_TIME seconds
+if not confs['query_time']:
+    HOST_GET_TIME = 7200
+else:
+    HOST_GET_TIME = confs['query_time']
+
+# IP address for exporter's http data
+if not confs['source_ip_address']:
+    EXPORTER_IP = '127.0.0.1'
+else:
+    EXPORTER_IP = confs['source_ip_address']
+
+# IP port for exporter's http data
+if not confs['source_ip_port']:
+    EXPORTER_PORT = 9959
+else:
+    EXPORTER_PORT = confs['source_ip_port']
+
+if not confs['http_log_show']:
+    HTTP_LOG_SHOW=1
+else:
+    HTTP_LOG_SHOW=confs['http_log_show']
+
+if len(confs['hosts']) < 1:
+    print('No hosts to query. Check your config file.')
+    exit()
+
+
+hosts = []
+for host in confs['hosts']:
+    confs['hosts'][host]['title'] = host
+    hosts.append(confs['hosts'][host])
+
+
+headers = BytesIO()
+
+class QueuingHTTPServer(HTTPServer):
+
+    def __init__(self, server_address, HttpGetHandler, data, bind_and_activate=True):
+        HTTPServer.__init__(self, server_address, HttpGetHandler, bind_and_activate)
+        self.data = data
+
+class HttpGetHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+
+        if self.path == '/metrics':
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; version=0.0.4; charset=utf-8")
+            self.end_headers()
+            self.wfile.write('# HELP cert_expire Seconds till certificate expiration\n'.encode())
+            self.wfile.write('# TYPE cert_expire gauge\n'.encode())
+            for host in data.value:
+                cert_time_diff_output  = 'cert_expire{'
+                cert_time_diff_output += 'title="'+host['title']+'",'
+                cert_time_diff_output += 'domain="'+host['domain']+'",'
+                cert_time_diff_output += 'ip="'+host['ip']+'",'
+                cert_time_diff_output += 'port="'+str(host['port'])+'"'
+                cert_time_diff_output += '} '+str(host['sec'])+'\n'
+                self.wfile.write(cert_time_diff_output.encode())
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write('<html><head><meta charset="utf-8">'.encode())
+            self.wfile.write('<title>Certificates Checker.</title></head>'.encode())
+            self.wfile.write('<body><h1>Certificates Checker</h1><p><a href="/metrics">Metrics</a></p></body></html>'.encode())
+    
+    if HTTP_LOG_SHOW<1:
+        def log_message(self, format, *args):
+            return
+    
+
+def test(debug_type, debug_msg):
+    headers.write(debug_msg)
+
+def run_cert(data):
+    while True:
+
+        host_values = data.value
+        for host in hosts:
+            timestamp_diff = 0
+            try:
+                c = pycurl.Curl()
+                url = 'https://'+host['domain']
+                if 'port' in host and host['port']>0:
+                    pass
+                else:
+                    host['port'] = 443
+                url += ':'+str(host['port'])
+                url += '/'
+                c.setopt(c.URL, url)
+                if 'ip' in host and len(host['ip'])>0:
+                    resolve_str = host['domain']
+                    resolve_str += ':'+str(host['port'])
+                    resolve_str += ':'+host['ip']
+                    c.setopt(c.RESOLVE, [ resolve_str ])
+                c.setopt(c.VERBOSE, True)
+                #c.setopt(c.HEADER, 1)
+                c.setopt(c.DEBUGFUNCTION, test)
+                c.setopt(c.NOBODY, 1)
+                c.setopt(c.CAINFO, certifi.where())
+                c.perform()
+                c.close()
+
+                h = headers.getvalue()
+                codecs.register_error("strict", codecs.ignore_errors)
+                rows = codecs.decode(h,'UTF-8').splitlines()
+
+                for row in rows:
+                    
+                    match = re.findall("^(expire date):(.+?)$",row.strip())
+                    if match:
+                        date_iso = match[0][1].strip()
+                        timestamp_cur = time.time()
+                        timestamp_cert = time.mktime(datetime.datetime.strptime(date_iso,'%b %d %H:%M:%S %Y %Z').timetuple())
+                        timestamp_diff = timestamp_cert-timestamp_cur
+            except Exception as exp:
+                if HTTP_LOG_SHOW > 0:
+                    print('Cannot query: '+host['title'])
+                    pprint(exp)
+                    print('-------------------')
+                timestamp_diff=-1
+
+            host_exists = 0
+            for i, data_host in enumerate(host_values):
+                if 'title' not in data_host:
+                    data_host['title'] = ''
+                if 'title' not in host:
+                    host['title'] = ''
+                if data_host['title'] == host['title']:
+                    host_exists = 1
+                    host_values[i]['sec'] = math.ceil(timestamp_diff)
+            
+            
+            if host_exists < 1:
+                if 'domain' not in host:
+                    host['domain'] = ''
+                if 'ip' not in host:
+                    host['ip'] = ''
+                if 'port' not in host:
+                    host['port'] = ''
+                host_values.append({'title': host['title'], 'domain': host['domain'], 'ip': host['ip'], 'port': host['port'], 'sec': math.ceil(timestamp_diff)})
+        
+        data.value = host_values
+        
+        time.sleep(HOST_GET_TIME)
+
+
+def run_http(data):
+    httpd = QueuingHTTPServer((EXPORTER_IP, EXPORTER_PORT),HttpGetHandler,data)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pprint('KeyboardInterrupt')
+        httpd.server_close()
+
+
+if __name__ == '__main__':
+    manager = multiprocessing.Manager()
+    data = manager.Value(dict,[])
+    
+    process_data = Process(target=run_cert,args=(data,))
+    process_http = Process(target=run_http,args=(data,))
+    
+    process_data.start()
+    process_http.start()
+
+    process_data.join()
+    process_http.join()
