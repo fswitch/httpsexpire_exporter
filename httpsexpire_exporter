@@ -101,6 +101,7 @@ class HttpGetHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write('# HELP cert_expire Seconds till certificate expiration\n'.encode())
             self.wfile.write('# TYPE cert_expire gauge\n'.encode())
+            self.wfile.write('httpsexpire_up 1\n'.encode())
             for host in data.value:
                 cert_time_diff_output  = 'cert_expire{'
                 cert_time_diff_output += 'title="'+host['title']+'",'
